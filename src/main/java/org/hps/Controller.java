@@ -4,6 +4,8 @@ import io.fabric8.kubernetes.api.model.ServiceAccount;
 import io.fabric8.kubernetes.api.model.ServiceAccountBuilder;
 import io.fabric8.kubernetes.client.DefaultKubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClient;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 import org.apache.kafka.clients.admin.*;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.KafkaFuture;
@@ -52,6 +54,8 @@ public class Controller {
     static Instant lastUpScaleDecision;
     static Instant lastDownScaleDecision;
     static boolean firstIteration= true;
+
+    static float rate;
 
 
 
@@ -145,6 +149,16 @@ public class Controller {
         consumerGroupDescriptionMap = futureOfDescribeConsumerGroupsResult.get();
 
 
+        for (MemberDescription memberDescription : consumerGroupDescriptionMap.get(Controller.CONSUMER_GROUP).members()) {
+
+            if (!firstIteration) {
+                log.info("Calling the consumer {} for its consumption rate ", memberDescription.host());
+                rate = callForConsumptionRate(memberDescription.host());
+                break;
+            }
+        }
+
+
         if(!firstIteration){
             computeTotalArrivalRate();
         }else{
@@ -175,8 +189,7 @@ public class Controller {
         log.info("totalArrivalRate {}, totalconsumptionRate {}",
                 totalArrivalRate * 1000, totalConsumptionRate * 1000);
 
-        log.info("time since last up scale decision is {}", Duration.between(lastUpScaleDecision, Instant.now()).toSeconds());
-        log.info("time since last down scale decision is {}", Duration.between(lastUpScaleDecision, Instant.now()).toSeconds());
+
 
         youMightWanttoScale(totalArrivalRate);
 
@@ -188,25 +201,14 @@ public class Controller {
         int size = consumerGroupDescriptionMap.get(Controller.CONSUMER_GROUP).members().size();
         log.info("curent group size is {}", size);
 
-        if (Duration.between(lastUpScaleDecision, Instant.now()).toSeconds() >= 30 ) {
-            log.info("Upscale logic, Up scale cool down has ended");
-
-            upScaleLogic(totalArrivalRate, size);
-        } else {
-            log.info("Not checking  upscale logic, Up scale cool down has not ended yet");
-        }
-
-
-        if (Duration.between(lastDownScaleDecision, Instant.now()).toSeconds() >= 60 ) {
-            log.info("DownScaling logic, Down scale cool down has ended");
+        if(! upScaleLogic(totalArrivalRate, size)){
             downScaleLogic(totalArrivalRate, size);
-        }else {
-            log.info("Not checking  down scale logic, down scale cool down has not ended yet");
         }
+
     }
 
-    private static void upScaleLogic(double totalArrivalRate, int size) {
-        if ((totalArrivalRate * 1000) > size *poll) {
+    private static boolean upScaleLogic(double totalArrivalRate, int size) {
+        if ((totalArrivalRate * 1000) > size * rate) {
             log.info("Consumers are less than nb partition we can scale");
 
             try (final KubernetesClient k8s = new DefaultKubernetesClient()) {
@@ -218,18 +220,20 @@ public class Controller {
 
                 log.info("Since  arrival rate {} is greater than  maximum consumption rate " +
                         "{} ,  I up scaled  by one ", totalArrivalRate * 1000, size * poll);
+                return true;
             }
 
-            lastUpScaleDecision = Instant.now();
-            lastDownScaleDecision = Instant.now();
+
+
         }
+        return false;
     }
 
 
 
 
     private static void downScaleLogic(double totalArrivalRate, int size) {
-        if ((totalArrivalRate * 1000) < (size - 1) * poll) {
+        if ((totalArrivalRate * 1000) < (size - 1) * rate) {
 
             log.info("since  arrival rate {} is lower than maximum consumption rate " +
                             " with size - 1  I down scaled  by one {}",
@@ -240,14 +244,30 @@ public class Controller {
                 int replicas = k8s.apps().deployments().inNamespace("default").withName("cons1persec").get().getSpec().getReplicas();
                 if (replicas > 1) {
                     k8s.apps().deployments().inNamespace("default").withName("cons1persec").scale(replicas - 1);
-                    lastDownScaleDecision = Instant.now();
-                    lastUpScaleDecision = Instant.now();
+
 
                 } else {
                     log.info("Not going to  down scale since replicas already one");
                 }
             }
         }
+    }
+
+
+
+    private static float callForConsumptionRate(String host) {
+        ManagedChannel managedChannel = ManagedChannelBuilder.forAddress(host.substring(1), 5002)
+                .usePlaintext()
+                .build();
+        RateServiceGrpc.RateServiceBlockingStub rateServiceBlockingStub
+                = RateServiceGrpc.newBlockingStub(managedChannel);
+        RateRequest rateRequest = RateRequest.newBuilder().setRate("Give me your rate")
+                .build();
+        log.info("connected to server {}", host);
+        RateResponse rateResponse = rateServiceBlockingStub.consumptionRate(rateRequest);
+        log.info("Received response on the rate: " + rateResponse.getRate());
+        managedChannel.shutdown();
+        return rateResponse.getRate();
     }
 
 
