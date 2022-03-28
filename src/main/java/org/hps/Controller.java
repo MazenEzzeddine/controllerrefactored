@@ -1,5 +1,7 @@
 package org.hps;
 
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONObject;
 import io.fabric8.kubernetes.api.model.ServiceAccount;
 import io.fabric8.kubernetes.api.model.ServiceAccountBuilder;
 import io.fabric8.kubernetes.client.DefaultKubernetesClient;
@@ -9,12 +11,16 @@ import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.TopicPartition;
 
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.text.SimpleDateFormat;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Properties;
+import java.util.*;
 import java.util.concurrent.ExecutionException;
 
 import org.apache.logging.log4j.LogManager;
@@ -53,12 +59,15 @@ public class Controller {
     static Instant lastDownScaleDecision;
     static boolean firstIteration= true;
 
+    static HttpClient client = HttpClient.newHttpClient();
+
 
 
     public static void main(String[] args) throws ExecutionException, InterruptedException {
         readEnvAndCrateAdminClient();
         lastUpScaleDecision = Instant.now();
         lastDownScaleDecision = Instant.now();
+
 
 
 
@@ -71,6 +80,8 @@ public class Controller {
             log.info("Sleeping for {} seconds", sleep / 1000.0);
             Thread.sleep(sleep);
 
+
+            callPrometheus();
             log.info("End Iteration;");
             log.info("=============================================");
         }
@@ -169,16 +180,16 @@ public class Controller {
         }
 
 
-        totalConsumptionRate = (double) (totalcurrentcommittedoffset - totalpreviouscommittedoffset) / sleep;
-        totalArrivalRate = (double) (totalcurrentendoffset - totalpreviousendoffset) / sleep;
+        totalConsumptionRate = ((double) (totalcurrentcommittedoffset - totalpreviouscommittedoffset) / (double)sleep);
+        totalArrivalRate = ((double) (totalcurrentendoffset - totalpreviousendoffset) / (double)sleep);
 
         log.info("totalArrivalRate {}, totalconsumptionRate {}",
-                totalArrivalRate * 1000, totalConsumptionRate * 1000);
+                totalArrivalRate * 1000.0, totalConsumptionRate * 1000.0);
 
-        log.info("time since last up scale decision is {}", Duration.between(lastUpScaleDecision, Instant.now()).toSeconds());
-        log.info("time since last down scale decision is {}", Duration.between(lastUpScaleDecision, Instant.now()).toSeconds());
+   /*     log.info("time since last up scale decision is {}", Duration.between(lastUpScaleDecision, Instant.now()).toSeconds());
+        log.info("time since last down scale decision is {}", Duration.between(lastUpScaleDecision, Instant.now()).toSeconds());*/
 
-        youMightWanttoScale(totalArrivalRate);
+       // youMightWanttoScale(totalArrivalRate);
 
     }
 
@@ -249,6 +260,69 @@ public class Controller {
             }
         }
     }
+
+
+
+    private static void  callPrometheus() throws InterruptedException {
+
+    String all3 = "http://prometheus-operated:9090/api/v1/query?" +
+            "query=sum(rate(kafka_topic_partition_current_offset%7Btopic=%22testtopic1%22,namespace=%22default%22%7D%5B1m%5D))%20by%20(topic)";
+
+
+        try {
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(new URI(all3))
+                    .GET()
+                    .build();
+
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200) {
+               // System.out.println(response.body() + "\n");
+                parseJson(response.body());
+            } else {
+                System.out.println("Error: status = "
+                        + response.statusCode()
+                        + "\n");
+            }
+
+        } catch (IllegalArgumentException | IOException | InterruptedException | URISyntaxException ex) {
+            System.out.println("That is not a valid URI.\n");
+        }
+
+
+}
+
+
+    private static void parseJson(String json) {
+        JSONObject jsonObject = JSONObject.parseObject(json);
+        JSONObject j2 = (JSONObject)jsonObject.get("data");
+
+        JSONArray inter = j2.getJSONArray("result");
+        JSONObject jobj = (JSONObject) inter.get(0);
+
+        JSONArray jreq = jobj.getJSONArray("value");
+
+        //System.out.println("time stamp: " + jreq.getString(0));
+        System.out.println("totalArrivalRate prometheus: " + Double.parseDouble( jreq.getString(1)));
+
+
+        //System.out.println((System.currentTimeMillis()));
+
+        String ts = jreq.getString(0);
+        ts = ts.replace(".", "");
+        //TODO attention to the case where after the . there are less less than 3 digits
+        SimpleDateFormat sdf = new SimpleDateFormat("MMM dd,yyyy HH:mm:ss");
+        Date d = new Date(Long.parseLong(ts));
+        System.out.println("date to corresponding timestamp : " + sdf.format(d));
+
+       // System.out.println("==================================================");
+    }
+
+
+
+
 
 
 
