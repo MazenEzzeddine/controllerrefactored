@@ -6,6 +6,8 @@ import io.fabric8.kubernetes.api.model.ServiceAccount;
 import io.fabric8.kubernetes.api.model.ServiceAccountBuilder;
 import io.fabric8.kubernetes.client.DefaultKubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClient;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 import org.apache.kafka.clients.admin.*;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.KafkaFuture;
@@ -58,6 +60,8 @@ public class Controller {
     static Instant lastUpScaleDecision;
     static Instant lastDownScaleDecision;
     static boolean firstIteration= true;
+
+    static double totalMaxConsumptionRate =0.0;
 
     static HttpClient client = HttpClient.newHttpClient();
 
@@ -155,6 +159,23 @@ public class Controller {
                 describeConsumerGroupsResult.all();
         consumerGroupDescriptionMap = futureOfDescribeConsumerGroupsResult.get();
 
+        totalMaxConsumptionRate = 0.0;
+
+        for (MemberDescription memberDescription : consumerGroupDescriptionMap.get(Controller.CONSUMER_GROUP).members()) {
+
+            if (!firstIteration) {
+                log.info("Calling the consumer {} for its consumption rate ", memberDescription.host());
+                float rate = callForConsumptionRate(memberDescription.host());
+                log.info("Rate for this host {}", rate );
+                totalMaxConsumptionRate += (double)rate;
+               // maxConsumptionRatePerConsumer.put(memberDescription, rate);
+            }
+
+
+        }
+
+        log.info("total current Consumption Rate {}", totalMaxConsumptionRate);
+
 
         if(!firstIteration){
             computeTotalArrivalRate();
@@ -186,11 +207,32 @@ public class Controller {
         log.info("totalArrivalRate {}, totalconsumptionRate {}",
                 totalArrivalRate * 1000.0, totalConsumptionRate * 1000.0);
 
+
+
+
+
+
    /*     log.info("time since last up scale decision is {}", Duration.between(lastUpScaleDecision, Instant.now()).toSeconds());
         log.info("time since last down scale decision is {}", Duration.between(lastUpScaleDecision, Instant.now()).toSeconds());*/
 
-       // youMightWanttoScale(totalArrivalRate);
+        youMightWanttoScaleDynamically(totalArrivalRate);
 
+    }
+
+
+    private static float callForConsumptionRate(String host) {
+        ManagedChannel managedChannel = ManagedChannelBuilder.forAddress(host.substring(1), 5002)
+                .usePlaintext()
+                .build();
+        RateServiceGrpc.RateServiceBlockingStub rateServiceBlockingStub
+                = RateServiceGrpc.newBlockingStub(managedChannel);
+        RateRequest rateRequest = RateRequest.newBuilder().setRate("Give me your rate")
+                .build();
+        log.info("connected to server {}", host);
+        RateResponse rateResponse = rateServiceBlockingStub.consumptionRate(rateRequest);
+        log.info("Received response on the rate: " + rateResponse.getRate());
+        managedChannel.shutdown();
+        return rateResponse.getRate();
     }
 
 
@@ -215,6 +257,7 @@ public class Controller {
             log.info("Not checking  down scale logic, down scale cool down has not ended yet");
         }
     }
+
 
     private static void upScaleLogic(double totalArrivalRate, int size) {
         if ((totalArrivalRate * 1000) > size *poll) {
@@ -260,6 +303,97 @@ public class Controller {
             }
         }
     }
+
+
+    private static void youMightWanttoScaleDynamically (double totalArrivalRate) throws ExecutionException, InterruptedException {
+        log.info("Inside you youMightWanttoScaleDynamically");
+        int size = consumerGroupDescriptionMap.get(Controller.CONSUMER_GROUP).members().size();
+        log.info("current group size is {}", size);
+
+        if (Duration.between(lastUpScaleDecision, Instant.now()).toSeconds() >= 30 ) {
+            log.info("Upscale logic, Up scale cool down has ended");
+
+            if (upScaleLogicDynamic(totalArrivalRate, size)) {
+                return;
+            }
+        } else {
+            log.info("Not checking  upscale logic, Up scale cool down has not ended yet");
+        }
+
+      /*  if (upScaleLogicDynamic(totalArrivalRate, size)) {
+            return;
+        }*/
+
+
+
+        if (Duration.between(lastDownScaleDecision, Instant.now()).toSeconds() >= 30 ) {
+            log.info("DownScaling logic, Down scale cool down has ended");
+            downScaleLogicDynamic(totalArrivalRate, size);
+        }else {
+            log.info("Not checking  down scale logic, down scale cool down has not ended yet");
+        }
+
+        //downScaleLogicDynamic(totalArrivalRate, size);
+
+    }
+
+
+
+    private static boolean upScaleLogicDynamic(double totalArrivalRate, int size) {
+        if ((totalArrivalRate * 1000) > totalMaxConsumptionRate) {
+           // log.info("Consumers are less than nb partition we can scale");
+
+            try (final KubernetesClient k8s = new DefaultKubernetesClient()) {
+                ServiceAccount fabric8 = new ServiceAccountBuilder().withNewMetadata().withName("fabric8").endMetadata().build();
+                k8s.serviceAccounts().inNamespace("default").createOrReplace(fabric8);
+                k8s.apps().deployments().inNamespace("default").withName("cons1persec").scale(size + 1);
+
+                //  firstIteration = true;
+
+                log.info("Since  arrival rate {} is greater than  maximum consumption rate " +
+                        "{} ,  I up scaled  by one ", totalArrivalRate * 1000, totalMaxConsumptionRate);
+
+                lastDownScaleDecision = Instant.now();
+                lastUpScaleDecision = Instant.now();
+
+                return true;
+            }
+
+        }
+        return false;
+    }
+
+
+
+
+    private static void downScaleLogicDynamic(double totalArrivalRate, int size) {
+
+        if(size == 1) return;
+        double serviceRatePerConsumer = totalMaxConsumptionRate/(double)(size);
+
+        log.info("totalMaxConsumptionRate - serviceRatePerConsumer {}", serviceRatePerConsumer);
+        if ((totalArrivalRate * 1000.0) < totalMaxConsumptionRate - serviceRatePerConsumer) {
+
+            log.info("since  arrival rate {} is lower than maximum consumption rate " +
+                            " with size - 1  I down scaled  by one {}",
+                    totalArrivalRate * 1000, totalMaxConsumptionRate/(double)(size - 1));
+            try (final KubernetesClient k8s = new DefaultKubernetesClient()) {
+                ServiceAccount fabric8 = new ServiceAccountBuilder().withNewMetadata().withName("fabric8").endMetadata().build();
+                k8s.serviceAccounts().inNamespace("default").createOrReplace(fabric8);
+                int replicas = k8s.apps().deployments().inNamespace("default").withName("cons1persec").get().getSpec().getReplicas();
+                if (replicas > 1) {
+                    k8s.apps().deployments().inNamespace("default").withName("cons1persec").scale(replicas - 1);
+                    lastDownScaleDecision = Instant.now();
+                    lastUpScaleDecision = Instant.now();
+
+                } else {
+                    log.info("Not going to  down scale since replicas already one");
+                }
+            }
+        }
+    }
+
+
 
 
 
