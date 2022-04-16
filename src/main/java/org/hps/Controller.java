@@ -66,6 +66,10 @@ public class Controller {
     static HttpClient client = HttpClient.newHttpClient();
 
 
+    static double currenttotalArrivalRate=0.0;
+    static double previoustotalArrivalRate=0.0;
+
+
 
     public static void main(String[] args) throws ExecutionException, InterruptedException {
         readEnvAndCrateAdminClient();
@@ -85,7 +89,7 @@ public class Controller {
             Thread.sleep(sleep);
 
 
-            callPrometheus();
+           // callPrometheus();
             log.info("End Iteration;");
             log.info("=============================================");
         }
@@ -161,7 +165,7 @@ public class Controller {
 
         totalMaxConsumptionRate = 0.0;
 
-        for (MemberDescription memberDescription : consumerGroupDescriptionMap.get(Controller.CONSUMER_GROUP).members()) {
+       /* for (MemberDescription memberDescription : consumerGroupDescriptionMap.get(Controller.CONSUMER_GROUP).members()) {
 
             if (!firstIteration) {
                 log.info("Calling the consumer {} for its consumption rate ", memberDescription.host());
@@ -172,7 +176,7 @@ public class Controller {
             }
 
 
-        }
+        }*/
 
         log.info("total current Consumption Rate {}", totalMaxConsumptionRate);
 
@@ -193,6 +197,9 @@ public class Controller {
         long totalcurrentcommittedoffset = 0;
         long totalpreviousendoffset = 0;
         long totalcurrentendoffset = 0;
+
+
+        previoustotalArrivalRate= currenttotalArrivalRate;
         for (TopicPartition tp : offsets.keySet()) {
             totalpreviouscommittedoffset += previousPartitionToCommittedOffset.get(tp);
             totalcurrentcommittedoffset += currentPartitionToCommittedOffset.get(tp);
@@ -209,13 +216,42 @@ public class Controller {
 
 
 
+        currenttotalArrivalRate = totalArrivalRate;
+
+        log.info("current {}", currenttotalArrivalRate *1000);
+        log.info("previous {}", previoustotalArrivalRate*1000);
+        log.info("(((currenttotalArrivalRate-previoustotalArrivalRate)* 1000.0)/((double) sleep/1000.0)) {}",
+                (((currenttotalArrivalRate-previoustotalArrivalRate)* 1000.0)/((double) sleep/1000.0)) );
+
+
+
+        if((((currenttotalArrivalRate-previoustotalArrivalRate)* 1000.0)/((double) sleep/1000.0))  > 10.0){
+            log.info("Looks like sampling boundary issue");
+
+           log.info("(((currenttotalArrivalRate-previoustotalArrivalRate)* 1000.0)/((double) sleep/1000.0))  {}",
+                   (((currenttotalArrivalRate-previoustotalArrivalRate)* 1000.0)/((double) sleep/1000.0))   );
+
+            log.info("setting total Arrival Rate to {}",previoustotalArrivalRate *1000.0);
+
+            log.info(" Might setting total Arrival Rate to {}",(totalArrivalRate *1000.0)/2.0);
+
+
+
+            totalArrivalRate = previoustotalArrivalRate;
+
+        }
+
+
+
 
 
 
    /*     log.info("time since last up scale decision is {}", Duration.between(lastUpScaleDecision, Instant.now()).toSeconds());
         log.info("time since last down scale decision is {}", Duration.between(lastUpScaleDecision, Instant.now()).toSeconds());*/
 
-        youMightWanttoScaleDynamically(totalArrivalRate);
+        //youMightWanttoScaleDynamically(totalArrivalRate);
+
+       // youMightWanttoScale(totalArrivalRate);
 
     }
 
@@ -250,7 +286,7 @@ public class Controller {
         }
 
 
-        if (Duration.between(lastDownScaleDecision, Instant.now()).toSeconds() >= 60 ) {
+        if (Duration.between(lastDownScaleDecision, Instant.now()).toSeconds() >= 30 ) {
             log.info("DownScaling logic, Down scale cool down has ended");
             downScaleLogic(totalArrivalRate, size);
         }else {
